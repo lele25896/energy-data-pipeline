@@ -1,0 +1,110 @@
+# Local stack: Airflow 3 (LocalExecutor) + two Postgres servers.
+# Trimmed from the official Airflow 3.3.2 compose file:
+# no Celery/Redis/worker (LocalExecutor runs tasks as scheduler subprocesses),
+# no triggerer (no deferrable operators), no flower, no example DAGs.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.2
+  env_file: .env                      # EIA_API_KEY, FERNET_KEY, JWT secret, warehouse password
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}                 # encrypts connection passwords in the metadata DB
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    # Tasks report back to the API server (Airflow 3 task execution API); all components share the JWT secret
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${JWT_SECRET}
+    # Local dev only: UI without login. Never on a shared/exposed machine.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    # Connection id "warehouse", read by DAGs in Phase 2 (env-var connections never touch the metadata DB)
+    AIRFLOW_CONN_WAREHOUSE: postgresql://warehouse:${WAREHOUSE_PASSWORD}@warehouse:5432/warehouse
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+  depends_on: &airflow-depends-on
+    airflow-db:
+      condition: service_healthy
+
+services:
+  # Airflow's own metadata (DAG runs, task states). Internal only, no host port.
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  # The data warehouse: raw / staging / marts. Port 5432 exposed for psql, dbt and Power BI on the host.
+  warehouse:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: ${WAREHOUSE_PASSWORD}
+      POSTGRES_DB: warehouse
+    ports:
+      - "5432:5432"
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d:ro   # runs once, on an empty data volume
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "warehouse"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  # One-shot: migrate the metadata DB, then exit. Other Airflow services wait for it.
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Parses files in dags/ (separate process since Airflow 3)
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: always
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow-db-data:
+  warehouse-data:
